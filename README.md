@@ -16,7 +16,7 @@ It was written for ROS2 and C++ learning purposes, not with a library logic.
 
 ## **My Environment**
 
-- Ubuntu 20.0.04
+- Ubuntu 20.04.1 LTS
 - ROS2 Foxy
 - pcl 1.10
 - OpenCV 4.2.0
