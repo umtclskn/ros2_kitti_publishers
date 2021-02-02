@@ -1,10 +1,10 @@
 # ROS2 Kitti Dataset Publishers
 
 Sample ROS2 publisher application that transforms and publishes the Kitti Dataset into the ROS2 messages.
-The main ROS2 messages are published PointCloud2, Image, Imu, and MarkerArray.
+The published ROS2 messages are mainly PointCloud2, Image, Imu, and MarkerArray. 
 Also, this codebase can provide information on how to broadcast messages, configure CmakeList.txt, and package configurations for your basic and ROS2 projects.
 You can use dummy the Kitti dataset to generate Perception, Planning, or Controller outputs in the Autonomous Robotics lifecycle.
-It was written for ROS2 and C++ learning purposes, not with a library logic.
+It was written for only learning purposes, not as a library logic.
 
 ---
 
@@ -100,7 +100,7 @@ void KittiPublishersNode::init_file_path()
 
 # __Pipeline__
 
-* ## Implemented the following publishers.
+* ## Implementing the publishers.
 ```cpp
   publisher_point_cloud_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("kitti/point_cloud", 10);
   publisher_image_gray_left_ = this->create_publisher<sensor_msgs::msg::Image>("kitti/image/gray/left", 10);
@@ -150,7 +150,7 @@ This project is an example study I developed for my ROS2 and C ++ learning proce
 In CmakeList.txt, I will try the expressions one by one and discard the unnecessary ones.
 I tried polymorphism by writing custom Publisher in C ++ classes, but since I could not use Node as an independent object, so I used lots of if-else blocks :)
 You can send an e-mail to umtclskn@gmail.com for potential improvements, bugs, and incorrect implementations. Or you could open an issue here.
-I've not calibrated the image messages yet. I plan to return the camera calibration matrices by writing a ROS2 service.
+I've not calibrated the image messages yet. I'm planning to implement a ROS2 Service which will return thecamera calibration matrices.
 Because I will calibrate camera images in a perception module I will implement.
 
 # References
