@@ -6,8 +6,7 @@ cmake_minimum_required(VERSION 3.5)
 #foreach(i ${CMAKE_CXX_COMPILE_FEATURES})
 #  message("${i}")
 #endforeach()
-
-
+add_compile_options(-O2 -g)
 
 find_package(Threads REQUIRED)
 
@@ -22,6 +21,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(class_loader REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(shape_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
@@ -33,7 +33,7 @@ find_package(pcl_conversions REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(SDL2 REQUIRED)
 
-find_package(Boost REQUIRED COMPONENTS system) 
+find_package(Boost REQUIRED COMPONENTS system)
 find_package(PCL COMPONENTS common REQUIRED)
 
 
@@ -56,8 +56,9 @@ set(dependencies
     rclcpp
     rcutils
     sensor_msgs
+    nav_msgs
     std_msgs
-    tf2 
+    tf2
     tf2_ros
     tf2_msgs
 )
@@ -93,7 +94,13 @@ install(DIRECTORY include/
   DESTINATION include/
 )
 
-install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY launch/
+  DESTINATION share/${PROJECT_NAME}/
+)
+
+install(DIRECTORY config/
+  DESTINATION share/${PROJECT_NAME}
+)
 
 install(TARGETS
   ${PROJECT_NAME}
