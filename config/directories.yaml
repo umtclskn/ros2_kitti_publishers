@@ -1,0 +1,7 @@
+publisher_node:
+  ros__parameters:
+    data_file_root_path: '/media/zhou/KINGSTON/data'
+    data_file_date: '2011_09_26'
+    data_file_option: '_drive_0001_sync'
+    data_file_sensors: ['velodyne_points', 'image_00', 'image_01', 'image_02', 'image_03', 'oxts']
+

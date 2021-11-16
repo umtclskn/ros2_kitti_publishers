@@ -24,8 +24,21 @@ int main(int argc, char ** argv)
   rclcpp::init(argc, argv);
 
   setvbuf(stdout, NULL, _IONBF, BUFSIZ);
-  rclcpp::spin(std::make_shared<KittiPublishersNode>());
 
+  try {
+    rclcpp::spin(std::make_shared<KittiPublishersNode>());
+  } catch (const KittiExceptions &e) {
+    switch (e) {
+    case KittiExceptions::PATH_NOT_FOUND:
+      std::cerr << "Path not found!\n";
+      break;
+    case KittiExceptions::END_OF_FILE:
+      std::cerr << "Read end of file, process done.\n";
+      break;
+    default:
+      std::cerr << "Unknown error!\n";
+    }
+  }
   rclcpp::shutdown();
 
   return 0;
