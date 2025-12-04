@@ -110,15 +110,26 @@ void KittiPublishersNode::on_timer_callback()
         std::vector<std::string> oxts_parsed_array = parse_file_data_into_string_array(oxts_file_name, delimiter);
         
         // Check if we have enough data (OXTS files should have at least 30 fields)
-        if (oxts_parsed_array.size() < 30) {
+        if (oxts_parsed_array.empty()) {
             RCLCPP_WARN_THROTTLE(
                 this->get_logger(),
                 *this->get_clock(),
                 5000,
-                "OXTS data incomplete. Expected at least 30 fields, got %zu. Skipping.", 
-                oxts_parsed_array.size());
+                "OXTS file is empty or could not be parsed: %s", oxts_file_name.c_str());
+        } else if (oxts_parsed_array.size() < 30) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                5000,
+                "OXTS data incomplete. Expected at least 30 fields, got %zu. File: %s", 
+                oxts_parsed_array.size(), oxts_file_name.c_str());
         } else {
-            RCLCPP_INFO(this->get_logger(), "OxTs size: '%zu'", oxts_parsed_array.size());
+            RCLCPP_INFO_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                1000,
+                "OxTs size: '%zu' from file: %s", 
+                oxts_parsed_array.size(), oxts_file_name.c_str());
 
             auto nav_sat_fix_msg = std::make_unique<sensor_msgs::msg::NavSatFix>();
             prepare_navsatfix_msg(oxts_parsed_array , *nav_sat_fix_msg);
@@ -140,30 +151,86 @@ void KittiPublishersNode::on_timer_callback()
 }
 
 void KittiPublishersNode::convert_pcl_to_pointcloud2(sensor_msgs::msg::PointCloud2 & msg ){
+    // Initialize empty message first
+    msg.header.frame_id = "base_link";
+    msg.header.stamp = now();
+    
+    // Bounds check
+    if (file_index_ >= file_names_point_cloud_.size()) {
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            5000,
+            "Point cloud file index %zu out of bounds (max: %zu)", 
+            file_index_, file_names_point_cloud_.size());
+        return;
+    }
+    
     pcl::PointCloud<pcl::PointXYZI> cloud;
-
-    std::string filePath = get_path(KittiPublishersNode::PublisherType::POINT_CLOUD) + file_names_point_cloud_[file_index_];
-    std::fstream input(filePath, std::ios::in | std::ios::binary);
-    if(!input.good()){
+    std::string filePath = path_point_cloud_ + file_names_point_cloud_[file_index_];
+    
+    std::ifstream input(filePath, std::ios::in | std::ios::binary);
+    if(!input.is_open() || !input.good()){
       RCLCPP_WARN_THROTTLE(
           this->get_logger(), 
           *this->get_clock(), 
           5000,
           "Could not read Velodyne's point cloud file: %s", filePath.c_str());
-      // Return empty message
-      msg.header.frame_id = "base_link";
-      msg.header.stamp = now();
       return;
     }
+    
+    // Get file size to prevent reading beyond bounds
+    input.seekg(0, std::ios::end);
+    std::streampos file_size = input.tellg();
     input.seekg(0, std::ios::beg);
-
-    for (int i = 0; input.good() && !input.eof(); i++) {
+    
+    // Each point is 4 floats (x, y, z, intensity) = 16 bytes
+    const size_t point_size = 4 * sizeof(float);
+    const size_t max_points = file_size / point_size;
+    
+    // Safety limit to prevent excessive memory usage
+    const size_t max_safe_points = 200000; // ~3.2MB max
+    size_t points_to_read = std::min(max_points, max_safe_points);
+    
+    cloud.reserve(points_to_read);
+    
+    for (size_t i = 0; i < points_to_read; i++) {
         pcl::PointXYZI point;
-        input.read((char *) &point.x, 3*sizeof(float));
-        input.read((char *) &point.intensity, sizeof(float));
+        
+        // Read x, y, z (3 floats = 12 bytes)
+        input.read(reinterpret_cast<char*>(&point.x), 3 * sizeof(float));
+        
+        // Check if we successfully read the data
+        if (input.gcount() != 3 * sizeof(float)) {
+            break; // End of file or read error
+        }
+        
+        // Read intensity (1 float = 4 bytes)
+        input.read(reinterpret_cast<char*>(&point.intensity), sizeof(float));
+        
+        if (input.gcount() != sizeof(float)) {
+            break; // End of file or read error
+        }
+        
         cloud.push_back(point);
+        
+        // Check for EOF or errors
+        if (input.eof() || input.fail()) {
+            break;
+        }
     }
-
+    
+    input.close();
+    
+    if (cloud.empty()) {
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            5000,
+            "Point cloud file is empty or could not be read: %s", filePath.c_str());
+        return;
+    }
+    
     pcl::toROSMsg(cloud, msg);
     msg.header.frame_id = "base_link";
     msg.header.stamp = now();
@@ -183,7 +250,6 @@ void KittiPublishersNode::init_file_path()
 
 std::string KittiPublishersNode::get_path(KittiPublishersNode::PublisherType publisher_type)
 {
-  RCLCPP_INFO(this->get_logger(), "get_path: '%d'", static_cast<int>(publisher_type));
   std::string path;
   if (publisher_type == KittiPublishersNode::PublisherType::POINT_CLOUD){
     path = path_point_cloud_;
@@ -429,7 +495,7 @@ std::vector<std::string> KittiPublishersNode::parse_file_data_into_string_array(
     std::vector<std::string> tokens;
     std::ifstream f(file_name.c_str()); //taking file as inputstream
 
-    if(!f.good()){
+    if(!f.is_open() || !f.good()){
       RCLCPP_WARN_THROTTLE(
           this->get_logger(), 
           *this->get_clock(), 
@@ -444,18 +510,36 @@ std::vector<std::string> KittiPublishersNode::parse_file_data_into_string_array(
         ss << f.rdbuf(); // reading data
         file_content_string = ss.str();
     }
+    f.close();
+
+    // Remove trailing newlines and whitespace
+    while (!file_content_string.empty() && 
+           (file_content_string.back() == '\n' || 
+            file_content_string.back() == '\r' || 
+            file_content_string.back() == ' ')) {
+        file_content_string.pop_back();
+    }
 
     //https://www.codegrepper.com/code-examples/whatever/c%2B%2B+how+to+tokenize+a+string  
     size_t first = 0;
     while(first < file_content_string.size()){
-        size_t second = file_content_string.find_first_of(delimiter,first);
+        size_t second = file_content_string.find_first_of(delimiter, first);
         //first has index of start of token
         //second has index of end of token + 1;
         if(second == std::string::npos){
             second = file_content_string.size();
         }
-        std::string token = file_content_string.substr(first, second-first);
-        tokens.push_back(token);
+        
+        // Only add non-empty tokens
+        if (second > first) {
+            std::string token = file_content_string.substr(first, second-first);
+            // Remove any remaining whitespace from token
+            token.erase(0, token.find_first_not_of(" \t\r\n"));
+            token.erase(token.find_last_not_of(" \t\r\n") + 1);
+            if (!token.empty()) {
+                tokens.push_back(token);
+            }
+        }
         first = second + 1;
     }
 
