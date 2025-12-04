@@ -42,6 +42,9 @@
 #include <vector>
 #include <string>
 #include <cstdlib>
+#include <thread>
+#include <future>
+#include <atomic>
 
 #include "ros2_kitti_publishers/visibility.h"
 #include "ros2_kitti_publishers/WGS84toCartesian.hpp"
@@ -68,8 +71,10 @@ public:
 private:
   void on_timer_callback();
 
-  void init_file_path();
+  void init_file_path(const std::string& base_path);
   void create_publishers_data_file_names();
+  void load_timestamps();
+  rclcpp::Time parse_kitti_timestamp(const std::string& timestamp_str);
   std::vector<std::string> parse_file_data_into_string_array(std::string file_name, std::string delimiter);
 
   std::string mat_type2encoding(int mat_type);
@@ -78,9 +83,10 @@ private:
   void prepare_navsatfix_msg(std::vector<std::string> &oxts_tokenized_array, sensor_msgs::msg::NavSatFix &msg);
   void prepare_imu_msg(std::vector<std::string> &oxts_tokenized_array, sensor_msgs::msg::Imu &msg);
   void prepare_marker_array_msg(std::vector<std::string> &oxts_tokenized_array, visualization_msgs::msg::MarkerArray &msg);
-  void convert_pcl_to_pointcloud2(sensor_msgs::msg::PointCloud2 & msg );
+  void convert_pcl_to_pointcloud2(sensor_msgs::msg::PointCloud2 & msg, size_t file_index );
   
   size_t file_index_;
+  std::atomic<bool> is_processing_;  // Flag to prevent overlapping timer callbacks
 
   rclcpp::TimerBase::SharedPtr timer_;
 
@@ -101,12 +107,23 @@ private:
   std::vector<std::string> file_names_image_color_right_;
   std::vector<std::string> file_names_oxts_;
 
+  // Timestamp vectors for each data type
+  std::vector<rclcpp::Time> timestamps_point_cloud_;
+  std::vector<rclcpp::Time> timestamps_image_gray_left_;
+  std::vector<rclcpp::Time> timestamps_image_gray_right_;
+  std::vector<rclcpp::Time> timestamps_image_color_left_;
+  std::vector<rclcpp::Time> timestamps_image_color_right_;
+  std::vector<rclcpp::Time> timestamps_oxts_;
+
+  rclcpp::Time dataset_start_time_;  // First timestamp (t0) from dataset
+
   std::string path_point_cloud_;
   std::string path_image_gray_left_;
   std::string path_image_gray_right_;
   std::string path_image_color_left_;
   std::string path_image_color_right_;
   std::string path_oxts_;
+  std::string frame_id_;  // ROS2 frame ID for all messages
 };
 
 #endif  // ROS2_KITTI_PUBLISHERS__KITTI_PUBLISHERS_NODE_HPP_

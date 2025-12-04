@@ -1,4 +1,7 @@
 #include <chrono>
+#include <sstream>
+#include <iomanip>
+#include <ctime>
 
 #include "ros2_kitti_publishers/kitti_publishers_node.hpp"
 
@@ -8,8 +11,21 @@ using namespace cv;
 using namespace std::chrono_literals;
 
 KittiPublishersNode::KittiPublishersNode()
-: Node("publisher_node"), file_index_(0)
+: Node("publisher_node"), file_index_(0), is_processing_(false)
 {
+  // Declare ROS2 parameters with default values
+  this->declare_parameter<std::string>("dataset_base_path", "");
+  this->declare_parameter<std::string>("frame_id", "base_link");
+  this->declare_parameter<double>("publish_rate", 10.0);  // Hz
+
+  // Get parameters
+  std::string dataset_base_path = this->get_parameter("dataset_base_path").as_string();
+  frame_id_ = this->get_parameter("frame_id").as_string();
+  double publish_rate = this->get_parameter("publish_rate").as_double();
+
+  RCLCPP_INFO(this->get_logger(), "Dataset base path: %s", dataset_base_path.c_str());
+  RCLCPP_INFO(this->get_logger(), "Frame ID: %s", frame_id_.c_str());
+  RCLCPP_INFO(this->get_logger(), "Publish rate: %.2f Hz", publish_rate);
 
   publisher_point_cloud_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("kitti/point_cloud", 10);
   publisher_image_gray_left_ = this->create_publisher<sensor_msgs::msg::Image>("kitti/image/gray/left", 10);
@@ -20,16 +36,35 @@ KittiPublishersNode::KittiPublishersNode()
   publisher_nav_sat_fix_= this->create_publisher<sensor_msgs::msg::NavSatFix>("kitti/nav_sat_fix", 10);
   publisher_marker_array_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("kitti/marker_array", 10);
 
-  init_file_path();
+  init_file_path(dataset_base_path);
 
   create_publishers_data_file_names();
+  
+  // Load timestamps from KITTI dataset files
+  load_timestamps();
+
+  // Calculate timer period from rate
+  auto timer_period = std::chrono::milliseconds(static_cast<int>(1000.0 / publish_rate));
 
   timer_ = create_wall_timer(
-    100ms, std::bind(&KittiPublishersNode::on_timer_callback, this));
+    timer_period, std::bind(&KittiPublishersNode::on_timer_callback, this));
+  
+  RCLCPP_INFO(this->get_logger(), "KITTI Publishers Node initialized successfully");
 }
 
 void KittiPublishersNode::on_timer_callback()
 {
+    // Prevent overlapping callbacks - if previous callback is still processing, skip this one
+    bool expected = false;
+    if (!is_processing_.compare_exchange_strong(expected, true)) {
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            1000,
+            "Previous callback still processing, skipping this timer tick");
+        return;
+    }
+
     // Check if we have any data files loaded
     if (file_names_point_cloud_.empty() && 
         file_names_image_gray_left_.empty() && 
@@ -42,6 +77,7 @@ void KittiPublishersNode::on_timer_callback()
             *this->get_clock(), 
             5000, 
             "No data files found. Please check your data paths configuration.");
+        is_processing_ = false;
         return;
     }
 
@@ -62,112 +98,177 @@ void KittiPublishersNode::on_timer_callback()
             5000,
             "Reached end of dataset. Resetting to beginning.");
         file_index_ = 0;
+        is_processing_ = false;
         return;
     }
 
-    // 01- KITTI POINT CLOUDS2 MESSAGES START//
-    if (file_index_ < file_names_point_cloud_.size()) {
-        sensor_msgs::msg::PointCloud2 point_cloud2_msg;
-        convert_pcl_to_pointcloud2(point_cloud2_msg);
-        publisher_point_cloud_->publish(point_cloud2_msg);
+    // Store current index to avoid race conditions
+    const size_t current_index = file_index_;
+    
+    // Get real timestamps from KITTI dataset files
+    // If timestamps are available, use them; otherwise use current time
+    rclcpp::Time point_cloud_timestamp = this->now();
+    rclcpp::Time image_gray_left_timestamp = this->now();
+    rclcpp::Time image_gray_right_timestamp = this->now();
+    rclcpp::Time image_color_left_timestamp = this->now();
+    rclcpp::Time image_color_right_timestamp = this->now();
+    rclcpp::Time oxts_timestamp = this->now();
+    
+    // Use real timestamps from dataset if available
+    if (current_index < timestamps_point_cloud_.size()) {
+        point_cloud_timestamp = timestamps_point_cloud_[current_index];
     }
-    // 01- KITTI POINT CLOUDS2 MESSAGES END//
-
-    // 02- KITTI IMAGE MESSAGES START- gray_left(image_00), gray_right(image_01), color_left(image_02), color_right(image_03)//   
-    if (file_index_ < file_names_image_gray_left_.size()) {
-        auto image_message_gray_left = std::make_unique<sensor_msgs::msg::Image>();
-        std::string img_pat_gray_left = path_image_gray_left_ + file_names_image_gray_left_[file_index_];
-        convert_image_to_msg(*image_message_gray_left, img_pat_gray_left);
-        publisher_image_gray_left_->publish(std::move(image_message_gray_left));
+    if (current_index < timestamps_image_gray_left_.size()) {
+        image_gray_left_timestamp = timestamps_image_gray_left_[current_index];
+    }
+    if (current_index < timestamps_image_gray_right_.size()) {
+        image_gray_right_timestamp = timestamps_image_gray_right_[current_index];
+    }
+    if (current_index < timestamps_image_color_left_.size()) {
+        image_color_left_timestamp = timestamps_image_color_left_[current_index];
+    }
+    if (current_index < timestamps_image_color_right_.size()) {
+        image_color_right_timestamp = timestamps_image_color_right_[current_index];
+    }
+    if (current_index < timestamps_oxts_.size()) {
+        oxts_timestamp = timestamps_oxts_[current_index];
     }
 
-    if (file_index_ < file_names_image_gray_right_.size()) {
-        auto image_message_gray_right = std::make_unique<sensor_msgs::msg::Image>();
-        std::string img_pat_gray_right = path_image_gray_right_ + file_names_image_gray_right_[file_index_];
-        convert_image_to_msg(*image_message_gray_right, img_pat_gray_right);
-        publisher_image_gray_right_->publish(std::move(image_message_gray_right));
-    }
-
-    if (file_index_ < file_names_image_color_left_.size()) {
-        auto image_message_color_left = std::make_unique<sensor_msgs::msg::Image>();
-        std::string img_pat_color_left = path_image_color_left_ + file_names_image_color_left_[file_index_];
-        convert_image_to_msg(*image_message_color_left, img_pat_color_left);
-        publisher_image_color_left_->publish(std::move(image_message_color_left));
-    }
-
-    if (file_index_ < file_names_image_color_right_.size()) {
-        auto image_message_color_right = std::make_unique<sensor_msgs::msg::Image>();
-        std::string img_pat_color_right = path_image_color_right_ + file_names_image_color_right_[file_index_];
-        convert_image_to_msg(*image_message_color_right, img_pat_color_right);
-        publisher_image_color_right_->publish(std::move(image_message_color_right));
-    }
-    // 02- KITTI IMAGE MESSAGES END // 
-
-    // 03- KITTI OXTS to IMU, NAV & MARKERARRAY MESSAGE START//
-    if (file_index_ < file_names_oxts_.size()) {
-        std::string oxts_file_name = path_oxts_ + file_names_oxts_[file_index_];
-        const std::string delimiter = " ";
-        std::vector<std::string> oxts_parsed_array = parse_file_data_into_string_array(oxts_file_name, delimiter);
-        
-        // Check if we have enough data (OXTS files should have at least 30 fields)
-        if (oxts_parsed_array.empty()) {
-            RCLCPP_WARN_THROTTLE(
-                this->get_logger(),
-                *this->get_clock(),
-                5000,
-                "OXTS file is empty or could not be parsed: %s", oxts_file_name.c_str());
-        } else if (oxts_parsed_array.size() < 30) {
-            RCLCPP_WARN_THROTTLE(
-                this->get_logger(),
-                *this->get_clock(),
-                5000,
-                "OXTS data incomplete. Expected at least 30 fields, got %zu. File: %s", 
-                oxts_parsed_array.size(), oxts_file_name.c_str());
-        } else {
-            RCLCPP_INFO_THROTTLE(
-                this->get_logger(),
-                *this->get_clock(),
-                1000,
-                "OxTs size: '%zu' from file: %s", 
-                oxts_parsed_array.size(), oxts_file_name.c_str());
-
-            auto nav_sat_fix_msg = std::make_unique<sensor_msgs::msg::NavSatFix>();
-            prepare_navsatfix_msg(oxts_parsed_array , *nav_sat_fix_msg);
-
-            auto imu_msg = std::make_unique<sensor_msgs::msg::Imu>();
-            prepare_imu_msg(oxts_parsed_array , *imu_msg);
-
-            auto marker_array_msg = std::make_unique<visualization_msgs::msg::MarkerArray>();
-            prepare_marker_array_msg(oxts_parsed_array , *marker_array_msg);
-
-            publisher_imu_->publish(std::move(imu_msg));
-            publisher_nav_sat_fix_->publish(std::move(nav_sat_fix_msg));
-            publisher_marker_array_->publish(std::move(marker_array_msg));
+    // Use async to read files in parallel
+    auto point_cloud_future = std::async(std::launch::async, [this, current_index, point_cloud_timestamp]() {
+        if (current_index < file_names_point_cloud_.size()) {
+            sensor_msgs::msg::PointCloud2 msg;
+            convert_pcl_to_pointcloud2(msg, current_index);
+            msg.header.stamp = point_cloud_timestamp;  // Use real KITTI timestamp
+            return std::make_optional(msg);
         }
+        return std::optional<sensor_msgs::msg::PointCloud2>{};
+    });
+
+    auto image_gray_left_future = std::async(std::launch::async, [this, current_index, image_gray_left_timestamp]() {
+        if (current_index < file_names_image_gray_left_.size()) {
+            auto msg = std::make_unique<sensor_msgs::msg::Image>();
+            std::string path = path_image_gray_left_ + file_names_image_gray_left_[current_index];
+            convert_image_to_msg(*msg, path);
+            msg->header.stamp = image_gray_left_timestamp;  // Use real KITTI timestamp
+            return msg;
+        }
+        return std::unique_ptr<sensor_msgs::msg::Image>{};
+    });
+
+    auto image_gray_right_future = std::async(std::launch::async, [this, current_index, image_gray_right_timestamp]() {
+        if (current_index < file_names_image_gray_right_.size()) {
+            auto msg = std::make_unique<sensor_msgs::msg::Image>();
+            std::string path = path_image_gray_right_ + file_names_image_gray_right_[current_index];
+            convert_image_to_msg(*msg, path);
+            msg->header.stamp = image_gray_right_timestamp;  // Use real KITTI timestamp
+            return msg;
+        }
+        return std::unique_ptr<sensor_msgs::msg::Image>{};
+    });
+
+    auto image_color_left_future = std::async(std::launch::async, [this, current_index, image_color_left_timestamp]() {
+        if (current_index < file_names_image_color_left_.size()) {
+            auto msg = std::make_unique<sensor_msgs::msg::Image>();
+            std::string path = path_image_color_left_ + file_names_image_color_left_[current_index];
+            convert_image_to_msg(*msg, path);
+            msg->header.stamp = image_color_left_timestamp;  // Use real KITTI timestamp
+            return msg;
+        }
+        return std::unique_ptr<sensor_msgs::msg::Image>{};
+    });
+
+    auto image_color_right_future = std::async(std::launch::async, [this, current_index, image_color_right_timestamp]() {
+        if (current_index < file_names_image_color_right_.size()) {
+            auto msg = std::make_unique<sensor_msgs::msg::Image>();
+            std::string path = path_image_color_right_ + file_names_image_color_right_[current_index];
+            convert_image_to_msg(*msg, path);
+            msg->header.stamp = image_color_right_timestamp;  // Use real KITTI timestamp
+            return msg;
+        }
+        return std::unique_ptr<sensor_msgs::msg::Image>{};
+    });
+
+    // OXTS is small, can be read synchronously
+    std::vector<std::string> oxts_parsed_array;
+    if (current_index < file_names_oxts_.size()) {
+        std::string oxts_file_name = path_oxts_ + file_names_oxts_[current_index];
+        const std::string delimiter = " ";
+        oxts_parsed_array = parse_file_data_into_string_array(oxts_file_name, delimiter);
     }
-    // 03- KITTI OXTS to IMU, NAV & MARKERARRAY MESSAGE END//
+
+    // Wait for all async operations to complete and publish
+    // 01- POINT CLOUD
+    auto point_cloud_opt = point_cloud_future.get();
+    if (point_cloud_opt.has_value()) {
+        publisher_point_cloud_->publish(point_cloud_opt.value());
+    }
+
+    // 02- IMAGES
+    auto img_gray_left = image_gray_left_future.get();
+    if (img_gray_left) {
+        publisher_image_gray_left_->publish(std::move(img_gray_left));
+    }
+
+    auto img_gray_right = image_gray_right_future.get();
+    if (img_gray_right) {
+        publisher_image_gray_right_->publish(std::move(img_gray_right));
+    }
+
+    auto img_color_left = image_color_left_future.get();
+    if (img_color_left) {
+        publisher_image_color_left_->publish(std::move(img_color_left));
+    }
+
+    auto img_color_right = image_color_right_future.get();
+    if (img_color_right) {
+        publisher_image_color_right_->publish(std::move(img_color_right));
+    }
+
+    // 03- OXTS MESSAGES (use real KITTI timestamp)
+    if (!oxts_parsed_array.empty() && oxts_parsed_array.size() >= 30) {
+        auto nav_sat_fix_msg = std::make_unique<sensor_msgs::msg::NavSatFix>();
+        prepare_navsatfix_msg(oxts_parsed_array, *nav_sat_fix_msg);
+        nav_sat_fix_msg->header.stamp = oxts_timestamp;  // Use real KITTI timestamp
+
+        auto imu_msg = std::make_unique<sensor_msgs::msg::Imu>();
+        prepare_imu_msg(oxts_parsed_array, *imu_msg);
+        imu_msg->header.stamp = oxts_timestamp;  // Use real KITTI timestamp
+
+        auto marker_array_msg = std::make_unique<visualization_msgs::msg::MarkerArray>();
+        prepare_marker_array_msg(oxts_parsed_array, *marker_array_msg);
+        // Set timestamp for all markers in the array
+        for (auto& marker : marker_array_msg->markers) {
+            marker.header.stamp = oxts_timestamp;
+        }
+
+        publisher_imu_->publish(std::move(imu_msg));
+        publisher_nav_sat_fix_->publish(std::move(nav_sat_fix_msg));
+        publisher_marker_array_->publish(std::move(marker_array_msg));
+    }
 
     file_index_++;
+    is_processing_ = false;
 }
 
-void KittiPublishersNode::convert_pcl_to_pointcloud2(sensor_msgs::msg::PointCloud2 & msg ){
+void KittiPublishersNode::convert_pcl_to_pointcloud2(sensor_msgs::msg::PointCloud2 & msg, size_t file_index ){
     // Initialize empty message first
-    msg.header.frame_id = "base_link";
+    msg.header.frame_id = frame_id_;
     msg.header.stamp = now();
     
     // Bounds check
-    if (file_index_ >= file_names_point_cloud_.size()) {
+    if (file_index >= file_names_point_cloud_.size()) {
         RCLCPP_WARN_THROTTLE(
             this->get_logger(),
             *this->get_clock(),
             5000,
             "Point cloud file index %zu out of bounds (max: %zu)", 
-            file_index_, file_names_point_cloud_.size());
+            file_index, file_names_point_cloud_.size());
         return;
     }
     
     pcl::PointCloud<pcl::PointXYZI> cloud;
-    std::string filePath = path_point_cloud_ + file_names_point_cloud_[file_index_];
+    std::string filePath = path_point_cloud_ + file_names_point_cloud_[file_index];
     
     std::ifstream input(filePath, std::ios::in | std::ios::binary);
     if(!input.is_open() || !input.good()){
@@ -232,20 +333,26 @@ void KittiPublishersNode::convert_pcl_to_pointcloud2(sensor_msgs::msg::PointClou
     }
     
     pcl::toROSMsg(cloud, msg);
-    msg.header.frame_id = "base_link";
+    msg.header.frame_id = frame_id_;
     msg.header.stamp = now();
 }
 
-void KittiPublishersNode::init_file_path()
+void KittiPublishersNode::init_file_path(const std::string& base_path)
 {
-    // Updated path for drive_0014_sync dataset (WSL filesystem path)
-    const std::string base_path = "/home/umut/kitti/2011_09_26/2011_09_26_drive_0014_sync/";
-    path_point_cloud_ = base_path + "velodyne_points/data/";
-    path_image_gray_left_ = base_path + "image_00/data/";
-    path_image_gray_right_ = base_path + "image_01/data/";
-    path_image_color_left_ = base_path + "image_02/data/";
-    path_image_color_right_ = base_path + "image_03/data/";
-    path_oxts_ = base_path + "oxts/data/";
+    // Ensure base_path ends with '/'
+    std::string normalized_path = base_path;
+    if (!normalized_path.empty() && normalized_path.back() != '/') {
+        normalized_path += "/";
+    }
+    
+    path_point_cloud_ = normalized_path + "velodyne_points/data/";
+    path_image_gray_left_ = normalized_path + "image_00/data/";
+    path_image_gray_right_ = normalized_path + "image_01/data/";
+    path_image_color_left_ = normalized_path + "image_02/data/";
+    path_image_color_right_ = normalized_path + "image_03/data/";
+    path_oxts_ = normalized_path + "oxts/data/";
+    
+    RCLCPP_DEBUG(this->get_logger(), "Initialized paths from base: %s", normalized_path.c_str());
 }
 
 std::string KittiPublishersNode::get_path(KittiPublishersNode::PublisherType publisher_type)
@@ -350,11 +457,205 @@ void KittiPublishersNode::create_publishers_data_file_names()
   }
 }
 
+rclcpp::Time KittiPublishersNode::parse_kitti_timestamp(const std::string& timestamp_str)
+{
+  // KITTI timestamp format: "2011-09-26 13:11:15.406628381"
+  // Parse: YYYY-MM-DD HH:MM:SS.nanoseconds
+  
+  std::tm tm = {};
+  std::string date_time = timestamp_str.substr(0, 19);  // "2011-09-26 13:11:15"
+  std::string nanoseconds_str = timestamp_str.substr(20); // "406628381"
+  
+  // Parse date and time
+  std::istringstream ss(date_time);
+  ss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
+  
+  if (ss.fail()) {
+    RCLCPP_WARN(this->get_logger(), "Failed to parse timestamp: %s", timestamp_str.c_str());
+    return this->now();
+  }
+  
+  // Convert to Unix timestamp (seconds since 1970-01-01)
+  // KITTI timestamps are in UTC
+  // Use reference epoch: 2011-09-26 00:00:00 UTC = 1316995200 seconds since Unix epoch
+  const int64_t reference_epoch = 1316995200LL;
+  
+  // Calculate time difference from reference date (2011-09-26)
+  int year = tm.tm_year + 1900;
+  int month = tm.tm_mon + 1;  // tm_mon is 0-11, so add 1
+  int day = tm.tm_mday;
+  
+  // Calculate days from 2011-09-26
+  int64_t days_diff = 0;
+  if (year == 2011 && month >= 9) {
+    // Days from September 26
+    int days_in_sep = day - 26;
+    // Add days for months after September (Oct, Nov, Dec)
+    int days_in_months[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    for (int m = 10; m <= month; m++) {
+      days_diff += days_in_months[m];
+    }
+    days_diff += days_in_sep;
+  }
+  
+  // Calculate total seconds from reference
+  int64_t total_seconds = reference_epoch + (days_diff * 86400LL) + 
+                          (tm.tm_hour * 3600LL) + (tm.tm_min * 60LL) + tm.tm_sec;
+  
+  // Add nanoseconds
+  int64_t nanoseconds = 0;
+  try {
+    nanoseconds = std::stoll(nanoseconds_str);
+  } catch (const std::exception& e) {
+    RCLCPP_WARN(this->get_logger(), "Failed to parse nanoseconds: %s", nanoseconds_str.c_str());
+  }
+  
+  // Convert to ROS2 Time (nanoseconds since Unix epoch)
+  int64_t total_nanoseconds = total_seconds * 1000000000LL + nanoseconds;
+  
+  return rclcpp::Time(total_nanoseconds, RCL_ROS_TIME);
+}
+
+void KittiPublishersNode::load_timestamps()
+{
+  RCLCPP_INFO(this->get_logger(), "Loading timestamps from KITTI dataset...");
+  
+  // Helper lambda to load timestamps from a file
+  auto load_timestamp_file = [this](const std::string& file_path, std::vector<rclcpp::Time>& timestamps) {
+    std::ifstream file(file_path);
+    if (!file.is_open()) {
+      RCLCPP_WARN(this->get_logger(), "Could not open timestamp file: %s", file_path.c_str());
+      return false;
+    }
+    
+    std::string line;
+    while (std::getline(file, line)) {
+      // Remove trailing whitespace and newlines
+      line.erase(0, line.find_first_not_of(" \t\r\n"));
+      line.erase(line.find_last_not_of(" \t\r\n") + 1);
+      
+      if (!line.empty()) {
+        rclcpp::Time ts = parse_kitti_timestamp(line);
+        timestamps.push_back(ts);
+      }
+    }
+    file.close();
+    return true;
+  };
+  
+  // Load timestamps for each data type
+  bool loaded_any = false;
+  
+  if (!file_names_point_cloud_.empty()) {
+    std::string timestamp_file = path_point_cloud_ + "../timestamps.txt";
+    if (load_timestamp_file(timestamp_file, timestamps_point_cloud_)) {
+      RCLCPP_INFO(this->get_logger(), "Loaded %zu point cloud timestamps", timestamps_point_cloud_.size());
+      loaded_any = true;
+    }
+  }
+  
+  if (!file_names_image_gray_left_.empty()) {
+    std::string timestamp_file = path_image_gray_left_ + "../timestamps.txt";
+    if (load_timestamp_file(timestamp_file, timestamps_image_gray_left_)) {
+      RCLCPP_INFO(this->get_logger(), "Loaded %zu image gray left timestamps", timestamps_image_gray_left_.size());
+      loaded_any = true;
+    }
+  }
+  
+  if (!file_names_image_gray_right_.empty()) {
+    std::string timestamp_file = path_image_gray_right_ + "../timestamps.txt";
+    if (load_timestamp_file(timestamp_file, timestamps_image_gray_right_)) {
+      RCLCPP_INFO(this->get_logger(), "Loaded %zu image gray right timestamps", timestamps_image_gray_right_.size());
+      loaded_any = true;
+    }
+  }
+  
+  if (!file_names_image_color_left_.empty()) {
+    std::string timestamp_file = path_image_color_left_ + "../timestamps.txt";
+    if (load_timestamp_file(timestamp_file, timestamps_image_color_left_)) {
+      RCLCPP_INFO(this->get_logger(), "Loaded %zu image color left timestamps", timestamps_image_color_left_.size());
+      loaded_any = true;
+    }
+  }
+  
+  if (!file_names_image_color_right_.empty()) {
+    std::string timestamp_file = path_image_color_right_ + "../timestamps.txt";
+    if (load_timestamp_file(timestamp_file, timestamps_image_color_right_)) {
+      RCLCPP_INFO(this->get_logger(), "Loaded %zu image color right timestamps", timestamps_image_color_right_.size());
+      loaded_any = true;
+    }
+  }
+  
+  if (!file_names_oxts_.empty()) {
+    std::string timestamp_file = path_oxts_ + "../timestamps.txt";
+    if (load_timestamp_file(timestamp_file, timestamps_oxts_)) {
+      RCLCPP_INFO(this->get_logger(), "Loaded %zu OXTS timestamps", timestamps_oxts_.size());
+      loaded_any = true;
+    }
+  }
+  
+  // Find the earliest timestamp (t0) from all loaded timestamps
+  if (loaded_any) {
+    bool first_found = false;
+    rclcpp::Time earliest(0, 0, RCL_ROS_TIME);  // Initialize with same time source
+    
+    // Find the first available timestamp to use as initial value
+    if (!timestamps_point_cloud_.empty()) {
+      earliest = timestamps_point_cloud_[0];
+      first_found = true;
+    } else if (!timestamps_image_gray_left_.empty()) {
+      earliest = timestamps_image_gray_left_[0];
+      first_found = true;
+    } else if (!timestamps_image_gray_right_.empty()) {
+      earliest = timestamps_image_gray_right_[0];
+      first_found = true;
+    } else if (!timestamps_image_color_left_.empty()) {
+      earliest = timestamps_image_color_left_[0];
+      first_found = true;
+    } else if (!timestamps_image_color_right_.empty()) {
+      earliest = timestamps_image_color_right_[0];
+      first_found = true;
+    } else if (!timestamps_oxts_.empty()) {
+      earliest = timestamps_oxts_[0];
+      first_found = true;
+    }
+    
+    // Now compare with all timestamps to find the earliest
+    if (first_found) {
+      if (!timestamps_point_cloud_.empty() && timestamps_point_cloud_[0] < earliest) {
+        earliest = timestamps_point_cloud_[0];
+      }
+      if (!timestamps_image_gray_left_.empty() && timestamps_image_gray_left_[0] < earliest) {
+        earliest = timestamps_image_gray_left_[0];
+      }
+      if (!timestamps_image_gray_right_.empty() && timestamps_image_gray_right_[0] < earliest) {
+        earliest = timestamps_image_gray_right_[0];
+      }
+      if (!timestamps_image_color_left_.empty() && timestamps_image_color_left_[0] < earliest) {
+        earliest = timestamps_image_color_left_[0];
+      }
+      if (!timestamps_image_color_right_.empty() && timestamps_image_color_right_[0] < earliest) {
+        earliest = timestamps_image_color_right_[0];
+      }
+      if (!timestamps_oxts_.empty() && timestamps_oxts_[0] < earliest) {
+        earliest = timestamps_oxts_[0];
+      }
+    }
+    
+    dataset_start_time_ = earliest;
+    RCLCPP_INFO(this->get_logger(), "Dataset start time (t0): %.9f", 
+                dataset_start_time_.seconds());
+  } else {
+    RCLCPP_WARN(this->get_logger(), "No timestamps loaded. Using current time as reference.");
+    dataset_start_time_ = this->now();
+  }
+}
+
 
 void KittiPublishersNode::prepare_navsatfix_msg(std::vector<std::string> &oxts_tokenized_array, sensor_msgs::msg::NavSatFix &msg)
 {
-  msg.header.frame_id = "base_link";
-  msg.header.stamp = this->now();
+  msg.header.frame_id = frame_id_;
+  // Note: timestamp will be set by caller to ensure synchronization
 
   msg.status.service = sensor_msgs::msg::NavSatStatus::SERVICE_GPS;
   msg.status.status  = sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX;
@@ -389,8 +690,8 @@ void KittiPublishersNode::prepare_marker_array_msg(std::vector<std::string> &oxt
   visualization_msgs::msg::Marker RTK_MARKER;
 
   static int gps_track = 1;
-  RTK_MARKER.header.frame_id = "base_link";
-  RTK_MARKER.header.stamp = this->now();
+  RTK_MARKER.header.frame_id = frame_id_;
+  // Note: timestamp will be set by caller to ensure synchronization
   RTK_MARKER.ns = "RTK_MARKER";
   RTK_MARKER.id = gps_track++; //unused
   RTK_MARKER.type = visualization_msgs::msg::Marker::CYLINDER;
@@ -412,8 +713,8 @@ void KittiPublishersNode::prepare_marker_array_msg(std::vector<std::string> &oxt
 
 // https://github.com/iralabdisco/kitti_player/blob/public/src/kitti_player.cpp
 void KittiPublishersNode::prepare_imu_msg(std::vector<std::string> &oxts_tokenized_array, sensor_msgs::msg::Imu &msg){
-  msg.header.frame_id = "base_link";
-  msg.header.stamp = now();
+  msg.header.frame_id = frame_id_;
+  // Note: timestamp will be set by caller to ensure synchronization
 
   //    - ax:      acceleration in x, i.e. in direction of vehicle front (m/s^2)
   //    - ay:      acceleration in y, i.e. in direction of vehicle left (m/s^2)
@@ -456,8 +757,8 @@ void KittiPublishersNode::convert_image_to_msg(sensor_msgs::msg::Image & msg, co
         5000,
         "Image does not exist or could not be read: %s", path.c_str());
     // Return empty message
-    msg.header.frame_id = "base_link";
-    msg.header.stamp = this->now();
+    msg.header.frame_id = frame_id_;
+    // Note: timestamp will be set by caller to ensure synchronization
     return;
   }
 
@@ -470,8 +771,8 @@ void KittiPublishersNode::convert_image_to_msg(sensor_msgs::msg::Image & msg, co
   size_t size = frame.step * frame.rows;
   msg.data.resize(size);
   memcpy(&msg.data[0], frame.data, size);
-  msg.header.frame_id = "base_link";
-  msg.header.stamp = this->now();
+  msg.header.frame_id = frame_id_;
+  // Note: timestamp will be set by caller to ensure synchronization
 }
 
 std::string KittiPublishersNode::mat_type2encoding(int mat_type)

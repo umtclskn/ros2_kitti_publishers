@@ -1,0 +1,13 @@
+/**:
+  ros__parameters:
+    # Base path to KITTI dataset directory
+    # Example: /home/user/kitti/2011_09_26/2011_09_26_drive_0014_sync/
+    # NOTE: This parameter is required and must be set via launch file or command line
+    dataset_base_path: ""
+    
+    # ROS2 frame ID for all published messages
+    frame_id: "base_link"
+    
+    # Publishing rate in Hz (default: 10.0 Hz)
+    publish_rate: 10.0
+
