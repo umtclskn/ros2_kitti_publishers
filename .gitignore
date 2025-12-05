@@ -1,0 +1,19 @@
+# Refactoring plan (internal documentation, not for public repository)
+REFACTORING_PLAN.md
+
+# Build directories
+build/
+install/
+log/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+

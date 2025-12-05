@@ -322,11 +322,16 @@ The node now uses **real timestamps from KITTI dataset files** instead of system
 ## __Potential Improvements__
 
 This project is continuously being improved. Planned enhancements include:
-- SOLID principles refactoring
+- **SOLID principles refactoring** (see `REFACTORING_PLAN.md` for detailed plan)
+  - Single Responsibility Principle: Separate file I/O, conversion, and publishing concerns
+  - Open/Closed Principle: Use interfaces and factory patterns for extensibility
+  - Dependency Inversion: Abstract interfaces and dependency injection
 - Camera calibration service implementation
 - Support for async KITTI datasets
 - Unit tests and integration tests
 - Better documentation
+
+**Next Steps:** See `REFACTORING_PLAN.md` for the detailed refactoring roadmap.
 
 Contributions and suggestions are welcome! You can:
 - Open an issue for bugs or feature requests

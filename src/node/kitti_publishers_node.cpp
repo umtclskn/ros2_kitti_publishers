@@ -462,9 +462,25 @@ rclcpp::Time KittiPublishersNode::parse_kitti_timestamp(const std::string& times
   // KITTI timestamp format: "2011-09-26 13:11:15.406628381"
   // Parse: YYYY-MM-DD HH:MM:SS.nanoseconds
   
+  // Validate minimum length (at least 20 characters: "2011-09-26 13:11:15.")
+  if (timestamp_str.length() < 20) {
+    RCLCPP_WARN(this->get_logger(), "Timestamp string too short (expected at least 20 chars, got %zu): %s", 
+                timestamp_str.length(), timestamp_str.c_str());
+    return this->now();
+  }
+  
   std::tm tm = {};
   std::string date_time = timestamp_str.substr(0, 19);  // "2011-09-26 13:11:15"
-  std::string nanoseconds_str = timestamp_str.substr(20); // "406628381"
+  std::string nanoseconds_str;
+  
+  // Safely extract nanoseconds part (from position 20 to end)
+  if (timestamp_str.length() > 20) {
+    nanoseconds_str = timestamp_str.substr(20); // "406628381"
+  } else {
+    // If exactly 20 characters, no nanoseconds part
+    nanoseconds_str = "0";
+    RCLCPP_DEBUG(this->get_logger(), "No nanoseconds in timestamp, using 0: %s", timestamp_str.c_str());
+  }
   
   // Parse date and time
   std::istringstream ss(date_time);
@@ -529,18 +545,53 @@ void KittiPublishersNode::load_timestamps()
     }
     
     std::string line;
+    size_t line_number = 0;
+    size_t valid_timestamps = 0;
+    size_t invalid_timestamps = 0;
+    
     while (std::getline(file, line)) {
+      line_number++;
+      
       // Remove trailing whitespace and newlines
       line.erase(0, line.find_first_not_of(" \t\r\n"));
       line.erase(line.find_last_not_of(" \t\r\n") + 1);
       
-      if (!line.empty()) {
+      if (line.empty() || line.find("Zone.Identifier") != std::string::npos) {
+        continue; // Skip empty lines and Zone.Identifier files
+      }
+      
+      // Parse timestamp with exception handling
+      try {
         rclcpp::Time ts = parse_kitti_timestamp(line);
         timestamps.push_back(ts);
+        valid_timestamps++;
+      } catch (const std::out_of_range& e) {
+        invalid_timestamps++;
+        RCLCPP_WARN_THROTTLE(
+          this->get_logger(),
+          *this->get_clock(),
+          5000,
+          "Out of range error parsing timestamp at line %zu in %s: %s (error: %s)", 
+          line_number, file_path.c_str(), line.c_str(), e.what());
+      } catch (const std::exception& e) {
+        invalid_timestamps++;
+        RCLCPP_WARN_THROTTLE(
+          this->get_logger(),
+          *this->get_clock(),
+          5000,
+          "Failed to parse timestamp at line %zu in %s: %s (error: %s)", 
+          line_number, file_path.c_str(), line.c_str(), e.what());
       }
     }
     file.close();
-    return true;
+    
+    if (invalid_timestamps > 0) {
+      RCLCPP_WARN(this->get_logger(), 
+                  "Loaded %zu valid timestamps, skipped %zu invalid timestamps from %s",
+                  valid_timestamps, invalid_timestamps, file_path.c_str());
+    }
+    
+    return valid_timestamps > 0; // Return true if at least one valid timestamp was loaded
   };
   
   // Load timestamps for each data type
