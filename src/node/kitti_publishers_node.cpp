@@ -11,7 +11,9 @@ using namespace cv;
 using namespace std::chrono_literals;
 
 KittiPublishersNode::KittiPublishersNode()
-: Node("publisher_node"), file_index_(0), is_processing_(false)
+: Node("publisher_node"), file_index_(0), is_processing_(false),
+    published_image_color_right_count_(0), skipped_image_color_right_count_(0),
+    published_image_gray_right_count_(0), skipped_image_gray_right_count_(0)
 {
   // Declare ROS2 parameters with default values
   this->declare_parameter<std::string>("dataset_base_path", "");
@@ -36,15 +38,77 @@ KittiPublishersNode::KittiPublishersNode()
   publisher_nav_sat_fix_= this->create_publisher<sensor_msgs::msg::NavSatFix>("kitti/nav_sat_fix", 10);
   publisher_marker_array_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("kitti/marker_array", 10);
 
-  init_file_path(dataset_base_path);
+  // Initialize FileManager and use it for path and file management
+  file_manager_ = std::make_unique<ros2_kitti_publishers::FileManager>();
+  auto dataset_paths = file_manager_->initializePaths(dataset_base_path);
+  
+  // Store paths (temporary - will be refactored further)
+  path_point_cloud_ = dataset_paths.point_cloud;
+  path_image_gray_left_ = dataset_paths.image_gray_left;
+  path_image_gray_right_ = dataset_paths.image_gray_right;
+  path_image_color_left_ = dataset_paths.image_color_left;
+  path_image_color_right_ = dataset_paths.image_color_right;
+  path_oxts_ = dataset_paths.oxts;
+  
+  RCLCPP_DEBUG(this->get_logger(), "Initialized paths from base: %s", dataset_base_path.c_str());
 
+  // Use FileManager to get file lists
   create_publishers_data_file_names();
+  
+  // Log file counts for debugging
+  RCLCPP_INFO(this->get_logger(), "File counts - Point cloud: %zu, Gray left: %zu, Gray right: %zu, Color left: %zu, Color right: %zu, OXTS: %zu",
+              file_names_point_cloud_.size(),
+              file_names_image_gray_left_.size(),
+              file_names_image_gray_right_.size(),
+              file_names_image_color_left_.size(),
+              file_names_image_color_right_.size(),
+              file_names_oxts_.size());
+  
+  // Warn if file counts differ significantly (more than 1 file difference)
+  size_t max_count = std::max({
+      file_names_point_cloud_.size(),
+      file_names_image_gray_left_.size(),
+      file_names_image_gray_right_.size(),
+      file_names_image_color_left_.size(),
+      file_names_image_color_right_.size(),
+      file_names_oxts_.size()
+  });
+  
+  // Check each image type for file count mismatches
+  if (file_names_image_color_right_.size() != file_names_image_gray_right_.size()) {
+      RCLCPP_WARN(this->get_logger(), 
+                  "File count mismatch: image_color_right (%zu files) vs image_gray_right (%zu files). "
+                  "This may cause synchronization issues.",
+                  file_names_image_color_right_.size(), 
+                  file_names_image_gray_right_.size());
+  }
+  
+  if (file_names_image_color_right_.size() < max_count - 1) {
+      RCLCPP_WARN(this->get_logger(), 
+                  "image_color_right has significantly fewer files (%zu) than expected (%zu). "
+                  "Some frames may be skipped. Check if image_03/data/ directory has missing or corrupted files.",
+                  file_names_image_color_right_.size(), max_count);
+  }
   
   // Load timestamps from KITTI dataset files
   load_timestamps();
 
-  // Calculate timer period from rate
+  // Calculate timer period from rate with validation
+  if (publish_rate <= 0.0) {
+    RCLCPP_ERROR(this->get_logger(), 
+                 "Invalid publish_rate: %.2f Hz. Must be positive. Using default 10.0 Hz.", 
+                 publish_rate);
+    publish_rate = 10.0;
+  }
+  
   auto timer_period = std::chrono::milliseconds(static_cast<int>(1000.0 / publish_rate));
+  
+  if (timer_period.count() <= 0) {
+    RCLCPP_ERROR(this->get_logger(), 
+                 "Calculated timer period is invalid: %ld ms. Using default 100 ms.", 
+                 timer_period.count());
+    timer_period = std::chrono::milliseconds(100);
+  }
 
   timer_ = create_wall_timer(
     timer_period, std::bind(&KittiPublishersNode::on_timer_callback, this));
@@ -92,6 +156,14 @@ void KittiPublishersNode::on_timer_callback()
     });
 
     if (file_index_ >= max_files) {
+        // Log statistics before resetting
+        RCLCPP_INFO(this->get_logger(), 
+                    "Dataset cycle complete. Statistics - image_color_right: %zu published, %zu skipped | image_gray_right: %zu published, %zu skipped",
+                    published_image_color_right_count_,
+                    skipped_image_color_right_count_,
+                    published_image_gray_right_count_,
+                    skipped_image_gray_right_count_);
+        
         RCLCPP_WARN_THROTTLE(
             this->get_logger(),
             *this->get_clock(),
@@ -150,8 +222,14 @@ void KittiPublishersNode::on_timer_callback()
             auto msg = std::make_unique<sensor_msgs::msg::Image>();
             std::string path = path_image_gray_left_ + file_names_image_gray_left_[current_index];
             convert_image_to_msg(*msg, path);
-            msg->header.stamp = image_gray_left_timestamp;  // Use real KITTI timestamp
-            return msg;
+            // Check if image was successfully loaded (height and width > 0)
+            if (msg->height > 0 && msg->width > 0) {
+                msg->header.stamp = image_gray_left_timestamp;  // Use real KITTI timestamp
+                return msg;
+            } else {
+                // Image loading failed, return nullptr to skip publishing
+                return std::unique_ptr<sensor_msgs::msg::Image>{};
+            }
         }
         return std::unique_ptr<sensor_msgs::msg::Image>{};
     });
@@ -161,8 +239,31 @@ void KittiPublishersNode::on_timer_callback()
             auto msg = std::make_unique<sensor_msgs::msg::Image>();
             std::string path = path_image_gray_right_ + file_names_image_gray_right_[current_index];
             convert_image_to_msg(*msg, path);
-            msg->header.stamp = image_gray_right_timestamp;  // Use real KITTI timestamp
-            return msg;
+            // Check if image was successfully loaded (height and width > 0)
+            if (msg->height > 0 && msg->width > 0) {
+                msg->header.stamp = image_gray_right_timestamp;  // Use real KITTI timestamp
+                return msg;
+            } else {
+                // Image loading failed, return nullptr to skip publishing
+                // Log with more details for debugging
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(),
+                    *this->get_clock(),
+                    5000,
+                    "Skipping image_gray_right at index %zu (file: %s, path: %s) - failed to load or empty image",
+                    current_index, 
+                    file_names_image_gray_right_[current_index].c_str(),
+                    path.c_str());
+                return std::unique_ptr<sensor_msgs::msg::Image>{};
+            }
+        } else {
+            // Index out of bounds
+            RCLCPP_DEBUG_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                5000,
+                "image_gray_right index %zu out of bounds (max: %zu)",
+                current_index, file_names_image_gray_right_.size());
         }
         return std::unique_ptr<sensor_msgs::msg::Image>{};
     });
@@ -172,8 +273,14 @@ void KittiPublishersNode::on_timer_callback()
             auto msg = std::make_unique<sensor_msgs::msg::Image>();
             std::string path = path_image_color_left_ + file_names_image_color_left_[current_index];
             convert_image_to_msg(*msg, path);
-            msg->header.stamp = image_color_left_timestamp;  // Use real KITTI timestamp
-            return msg;
+            // Check if image was successfully loaded (height and width > 0)
+            if (msg->height > 0 && msg->width > 0) {
+                msg->header.stamp = image_color_left_timestamp;  // Use real KITTI timestamp
+                return msg;
+            } else {
+                // Image loading failed, return nullptr to skip publishing
+                return std::unique_ptr<sensor_msgs::msg::Image>{};
+            }
         }
         return std::unique_ptr<sensor_msgs::msg::Image>{};
     });
@@ -183,8 +290,31 @@ void KittiPublishersNode::on_timer_callback()
             auto msg = std::make_unique<sensor_msgs::msg::Image>();
             std::string path = path_image_color_right_ + file_names_image_color_right_[current_index];
             convert_image_to_msg(*msg, path);
-            msg->header.stamp = image_color_right_timestamp;  // Use real KITTI timestamp
-            return msg;
+            // Check if image was successfully loaded (height and width > 0)
+            if (msg->height > 0 && msg->width > 0) {
+                msg->header.stamp = image_color_right_timestamp;  // Use real KITTI timestamp
+                return msg;
+            } else {
+                // Image loading failed, return nullptr to skip publishing
+                // Log with more details for debugging
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(),
+                    *this->get_clock(),
+                    5000,
+                    "Skipping image_color_right at index %zu (file: %s, path: %s) - failed to load or empty image",
+                    current_index, 
+                    file_names_image_color_right_[current_index].c_str(),
+                    path.c_str());
+                return std::unique_ptr<sensor_msgs::msg::Image>{};
+            }
+        } else {
+            // Index out of bounds - this should not happen often
+            RCLCPP_DEBUG_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                5000,
+                "image_color_right index %zu out of bounds (max: %zu)",
+                current_index, file_names_image_color_right_.size());
         }
         return std::unique_ptr<sensor_msgs::msg::Image>{};
     });
@@ -193,7 +323,7 @@ void KittiPublishersNode::on_timer_callback()
     std::vector<std::string> oxts_parsed_array;
     if (current_index < file_names_oxts_.size()) {
         std::string oxts_file_name = path_oxts_ + file_names_oxts_[current_index];
-        const std::string delimiter = " ";
+    const std::string delimiter = " ";
         oxts_parsed_array = parse_file_data_into_string_array(oxts_file_name, delimiter);
     }
 
@@ -213,6 +343,20 @@ void KittiPublishersNode::on_timer_callback()
     auto img_gray_right = image_gray_right_future.get();
     if (img_gray_right) {
         publisher_image_gray_right_->publish(std::move(img_gray_right));
+        published_image_gray_right_count_++;
+    } else {
+        skipped_image_gray_right_count_++;
+        // Log every 10 skipped frames for visibility
+        if (skipped_image_gray_right_count_ % 10 == 0) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                5000,
+                "image_gray_right: %zu published, %zu skipped (current index: %zu)",
+                published_image_gray_right_count_,
+                skipped_image_gray_right_count_,
+                current_index);
+        }
     }
 
     auto img_color_left = image_color_left_future.get();
@@ -223,28 +367,42 @@ void KittiPublishersNode::on_timer_callback()
     auto img_color_right = image_color_right_future.get();
     if (img_color_right) {
         publisher_image_color_right_->publish(std::move(img_color_right));
+        published_image_color_right_count_++;
+    } else {
+        skipped_image_color_right_count_++;
+        // Log every 10 skipped frames for visibility
+        if (skipped_image_color_right_count_ % 10 == 0) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                5000,
+                "image_color_right: %zu published, %zu skipped (current index: %zu)",
+                published_image_color_right_count_,
+                skipped_image_color_right_count_,
+                current_index);
+        }
     }
 
     // 03- OXTS MESSAGES (use real KITTI timestamp)
     if (!oxts_parsed_array.empty() && oxts_parsed_array.size() >= 30) {
-        auto nav_sat_fix_msg = std::make_unique<sensor_msgs::msg::NavSatFix>();
+    auto nav_sat_fix_msg = std::make_unique<sensor_msgs::msg::NavSatFix>();
         prepare_navsatfix_msg(oxts_parsed_array, *nav_sat_fix_msg);
         nav_sat_fix_msg->header.stamp = oxts_timestamp;  // Use real KITTI timestamp
 
-        auto imu_msg = std::make_unique<sensor_msgs::msg::Imu>();
+    auto imu_msg = std::make_unique<sensor_msgs::msg::Imu>();
         prepare_imu_msg(oxts_parsed_array, *imu_msg);
         imu_msg->header.stamp = oxts_timestamp;  // Use real KITTI timestamp
 
-        auto marker_array_msg = std::make_unique<visualization_msgs::msg::MarkerArray>();
+    auto marker_array_msg = std::make_unique<visualization_msgs::msg::MarkerArray>();
         prepare_marker_array_msg(oxts_parsed_array, *marker_array_msg);
         // Set timestamp for all markers in the array
         for (auto& marker : marker_array_msg->markers) {
             marker.header.stamp = oxts_timestamp;
         }
 
-        publisher_imu_->publish(std::move(imu_msg));
-        publisher_nav_sat_fix_->publish(std::move(nav_sat_fix_msg));
-        publisher_marker_array_->publish(std::move(marker_array_msg));
+    publisher_imu_->publish(std::move(imu_msg));
+    publisher_nav_sat_fix_->publish(std::move(nav_sat_fix_msg));
+    publisher_marker_array_->publish(std::move(marker_array_msg));
     }
 
     file_index_++;
@@ -284,7 +442,7 @@ void KittiPublishersNode::convert_pcl_to_pointcloud2(sensor_msgs::msg::PointClou
     input.seekg(0, std::ios::end);
     std::streampos file_size = input.tellg();
     input.seekg(0, std::ios::beg);
-    
+
     // Each point is 4 floats (x, y, z, intensity) = 16 bytes
     const size_t point_size = 4 * sizeof(float);
     const size_t max_points = file_size / point_size;
@@ -331,7 +489,7 @@ void KittiPublishersNode::convert_pcl_to_pointcloud2(sensor_msgs::msg::PointClou
             "Point cloud file is empty or could not be read: %s", filePath.c_str());
         return;
     }
-    
+
     pcl::toROSMsg(cloud, msg);
     msg.header.frame_id = frame_id_;
     msg.header.stamp = now();
@@ -411,49 +569,49 @@ void KittiPublishersNode::create_publishers_data_file_names()
 {
   bool at_least_one_path_found = false;
   
-  for ( int type_index = 0; type_index != 6; type_index++ )
-  {
-    KittiPublishersNode::PublisherType type = static_cast<KittiPublishersNode::PublisherType>(type_index);
-    std::vector<std::string> file_names = get_filenames(type);
-    std::string path = get_path(type);
-
-   try
-   {
-      if (std::filesystem::exists(path) && std::filesystem::is_directory(path)) {
-        for (const auto & entry : std::filesystem::directory_iterator(path)){
-          if (entry.is_regular_file()) {
-              std::string filename = entry.path().filename().string();
-              // Filter out Windows Zone.Identifier files and other hidden/system files
-              if (filename.find("Zone.Identifier") == std::string::npos && 
-                  filename[0] != '.') {
-                  file_names.push_back(filename);
-              }
-          }
-        }
-
-        //Order file names
-        std::sort(file_names.begin(), file_names.end(),
-              [](const auto& lhs, const auto& rhs) {
-                  return lhs  < rhs ;
-              });
-        set_filenames(type, file_names);
-        
-        if (!file_names.empty()) {
-          at_least_one_path_found = true;
-          RCLCPP_INFO(this->get_logger(), "Found %zu files in path: %s", file_names.size(), path.c_str());
-        }
-      } else {
-        RCLCPP_WARN(this->get_logger(), "Path does not exist or is not a directory: %s", path.c_str());
-      }
-    }catch (const std::filesystem::filesystem_error& e)
-    {
-        RCLCPP_ERROR(this->get_logger(), "File path error for '%s': %s", path.c_str(), e.what());
-    }
+  // Use FileManager to get file lists for each path
+  file_names_point_cloud_ = file_manager_->getFileList(path_point_cloud_);
+  file_names_image_gray_left_ = file_manager_->getFileList(path_image_gray_left_);
+  file_names_image_gray_right_ = file_manager_->getFileList(path_image_gray_right_);
+  file_names_image_color_left_ = file_manager_->getFileList(path_image_color_left_);
+  file_names_image_color_right_ = file_manager_->getFileList(path_image_color_right_);
+  file_names_oxts_ = file_manager_->getFileList(path_oxts_);
+  
+  // Log file counts
+  if (!file_names_point_cloud_.empty()) {
+    at_least_one_path_found = true;
+    RCLCPP_INFO(this->get_logger(), "Found %zu files in path: %s", 
+                file_names_point_cloud_.size(), path_point_cloud_.c_str());
+  }
+  if (!file_names_image_gray_left_.empty()) {
+    at_least_one_path_found = true;
+    RCLCPP_INFO(this->get_logger(), "Found %zu files in path: %s", 
+                file_names_image_gray_left_.size(), path_image_gray_left_.c_str());
+  }
+  if (!file_names_image_gray_right_.empty()) {
+    at_least_one_path_found = true;
+    RCLCPP_INFO(this->get_logger(), "Found %zu files in path: %s", 
+                file_names_image_gray_right_.size(), path_image_gray_right_.c_str());
+  }
+  if (!file_names_image_color_left_.empty()) {
+    at_least_one_path_found = true;
+    RCLCPP_INFO(this->get_logger(), "Found %zu files in path: %s", 
+                file_names_image_color_left_.size(), path_image_color_left_.c_str());
+  }
+  if (!file_names_image_color_right_.empty()) {
+    at_least_one_path_found = true;
+    RCLCPP_INFO(this->get_logger(), "Found %zu files in path: %s", 
+                file_names_image_color_right_.size(), path_image_color_right_.c_str());
+  }
+  if (!file_names_oxts_.empty()) {
+    at_least_one_path_found = true;
+    RCLCPP_INFO(this->get_logger(), "Found %zu files in path: %s", 
+                file_names_oxts_.size(), path_oxts_.c_str());
   }
   
   if (!at_least_one_path_found) {
-    RCLCPP_ERROR(this->get_logger(), 
-                 "No data files found in any configured path. Please check your data directory configuration.");
+    RCLCPP_WARN(this->get_logger(), 
+                "No data files found in any path. Please check your dataset_base_path configuration.");
   }
 }
 
@@ -473,11 +631,35 @@ rclcpp::Time KittiPublishersNode::parse_kitti_timestamp(const std::string& times
   std::string date_time = timestamp_str.substr(0, 19);  // "2011-09-26 13:11:15"
   std::string nanoseconds_str;
   
-  // Safely extract nanoseconds part (from position 20 to end)
+  // Safely extract nanoseconds part (from position 20 to end, skipping decimal point at position 19)
+  // Format: "2011-09-26 13:11:15.406628381"
+  //         0123456789012345678901234567890
+  //         0         1         2
+  // Position 19 is '.', position 20 is first nanosecond digit
   if (timestamp_str.length() > 20) {
-    nanoseconds_str = timestamp_str.substr(20); // "406628381"
+    // Check if position 19 is actually the decimal point
+    if (timestamp_str[19] == '.') {
+      nanoseconds_str = timestamp_str.substr(20); // "406628381" (starts after decimal point)
+    } else {
+      // Unexpected format, try to find decimal point
+      size_t dot_pos = timestamp_str.find('.', 15); // Look for '.' after time part
+      if (dot_pos != std::string::npos && dot_pos < timestamp_str.length() - 1) {
+        nanoseconds_str = timestamp_str.substr(dot_pos + 1); // Skip the decimal point
+      } else {
+        RCLCPP_WARN(this->get_logger(), "Unexpected timestamp format, no decimal point found: %s", timestamp_str.c_str());
+        nanoseconds_str = "0";
+      }
+    }
+  } else if (timestamp_str.length() == 20) {
+    // Exactly 20 characters means "2011-09-26 13:11:15." with no nanoseconds
+    if (timestamp_str[19] == '.') {
+      nanoseconds_str = "0";
+    } else {
+      RCLCPP_WARN(this->get_logger(), "Unexpected timestamp format at position 19: %s", timestamp_str.c_str());
+      nanoseconds_str = "0";
+    }
   } else {
-    // If exactly 20 characters, no nanoseconds part
+    // Less than 20 characters, no nanoseconds part
     nanoseconds_str = "0";
     RCLCPP_DEBUG(this->get_logger(), "No nanoseconds in timestamp, using 0: %s", timestamp_str.c_str());
   }
@@ -493,37 +675,75 @@ rclcpp::Time KittiPublishersNode::parse_kitti_timestamp(const std::string& times
   
   // Convert to Unix timestamp (seconds since 1970-01-01)
   // KITTI timestamps are in UTC
-  // Use reference epoch: 2011-09-26 00:00:00 UTC = 1316995200 seconds since Unix epoch
-  const int64_t reference_epoch = 1316995200LL;
+  // Generic calculation that works for any date from 1970 onwards
+  // We calculate days from Unix epoch (1970-01-01) to target date
   
-  // Calculate time difference from reference date (2011-09-26)
   int year = tm.tm_year + 1900;
   int month = tm.tm_mon + 1;  // tm_mon is 0-11, so add 1
   int day = tm.tm_mday;
   
-  // Calculate days from 2011-09-26
-  int64_t days_diff = 0;
-  if (year == 2011 && month >= 9) {
-    // Days from September 26
-    int days_in_sep = day - 26;
-    // Add days for months after September (Oct, Nov, Dec)
-    int days_in_months[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    for (int m = 10; m <= month; m++) {
-      days_diff += days_in_months[m];
-    }
-    days_diff += days_in_sep;
+  // Helper function to check if year is leap year
+  auto is_leap_year = [](int y) -> bool {
+    return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+  };
+  
+  // Days in each month (non-leap year)
+  const int days_in_months[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  
+  // Calculate total days from 1970-01-01 to target date
+  int64_t total_days = 0;
+  
+  // Add days for all complete years from 1970 to year-1
+  for (int y = 1970; y < year; y++) {
+    total_days += is_leap_year(y) ? 366 : 365;
   }
   
-  // Calculate total seconds from reference
-  int64_t total_seconds = reference_epoch + (days_diff * 86400LL) + 
-                          (tm.tm_hour * 3600LL) + (tm.tm_min * 60LL) + tm.tm_sec;
+  // Add days for all complete months in the target year
+  for (int m = 1; m < month; m++) {
+    total_days += days_in_months[m - 1];
+    if (m == 2 && is_leap_year(year)) {
+      total_days += 1;  // Add leap day for February
+    }
+  }
+  
+  // Add days in the target month (day - 1 because we want days from start of month)
+  total_days += day - 1;
+  
+  // Calculate total seconds from Unix epoch (1970-01-01 00:00:00 UTC)
+  int64_t total_seconds = total_days * 86400LL + 
+                          tm.tm_hour * 3600LL + 
+                          tm.tm_min * 60LL + 
+                          tm.tm_sec;
   
   // Add nanoseconds
+  // KITTI timestamps should have 9 fractional digits representing nanoseconds
+  // If fewer digits are present, we need to pad to 9 digits before conversion
+  // Example: "1" should become 100,000,000 nanoseconds (0.1 seconds)
+  //          "12" should become 120,000,000 nanoseconds (0.12 seconds)
+  //          "123456789" is already 9 digits, use as-is
   int64_t nanoseconds = 0;
   try {
-    nanoseconds = std::stoll(nanoseconds_str);
+    if (!nanoseconds_str.empty()) {
+      // Pad the fractional part to exactly 9 digits (right-pad with zeros)
+      std::string padded_nanoseconds = nanoseconds_str;
+      if (padded_nanoseconds.length() < 9) {
+        padded_nanoseconds.append(9 - padded_nanoseconds.length(), '0');
+      } else if (padded_nanoseconds.length() > 9) {
+        // If more than 9 digits, truncate to 9 (shouldn't happen in KITTI, but handle gracefully)
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            5000,
+            "Nanoseconds part has more than 9 digits (%zu), truncating: %s",
+            nanoseconds_str.length(), timestamp_str.c_str());
+        padded_nanoseconds = padded_nanoseconds.substr(0, 9);
+      }
+      nanoseconds = std::stoll(padded_nanoseconds);
+    }
   } catch (const std::exception& e) {
-    RCLCPP_WARN(this->get_logger(), "Failed to parse nanoseconds: %s", nanoseconds_str.c_str());
+    RCLCPP_WARN(this->get_logger(), "Failed to parse nanoseconds: %s (from timestamp: %s)", 
+                nanoseconds_str.c_str(), timestamp_str.c_str());
+    nanoseconds = 0;
   }
   
   // Convert to ROS2 Time (nanoseconds since Unix epoch)
@@ -884,12 +1104,12 @@ std::vector<std::string> KittiPublishersNode::parse_file_data_into_string_array(
         
         // Only add non-empty tokens
         if (second > first) {
-            std::string token = file_content_string.substr(first, second-first);
+        std::string token = file_content_string.substr(first, second-first);
             // Remove any remaining whitespace from token
             token.erase(0, token.find_first_not_of(" \t\r\n"));
             token.erase(token.find_last_not_of(" \t\r\n") + 1);
             if (!token.empty()) {
-                tokens.push_back(token);
+        tokens.push_back(token);
             }
         }
         first = second + 1;

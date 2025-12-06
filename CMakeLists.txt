@@ -55,6 +55,7 @@ include_directories(
 
 set(ROS2_KITTI_PUBLISHERS_SOURCES
   src/node/kitti_publishers_node.cpp
+  src/file_manager/file_manager.cpp
 )
 
 add_library(${PROJECT_NAME} SHARED ${ROS2_KITTI_PUBLISHERS_SOURCES})

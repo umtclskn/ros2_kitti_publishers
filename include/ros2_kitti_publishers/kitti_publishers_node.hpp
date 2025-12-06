@@ -48,6 +48,7 @@
 
 #include "ros2_kitti_publishers/visibility.h"
 #include "ros2_kitti_publishers/WGS84toCartesian.hpp"
+#include "ros2_kitti_publishers/file_manager.hpp"
 
 class KittiPublishersNode : public rclcpp::Node
 {
@@ -87,6 +88,15 @@ private:
   
   size_t file_index_;
   std::atomic<bool> is_processing_;  // Flag to prevent overlapping timer callbacks
+  
+  // Statistics counters for debugging
+  size_t published_image_color_right_count_;
+  size_t skipped_image_color_right_count_;
+  size_t published_image_gray_right_count_;
+  size_t skipped_image_gray_right_count_;
+  
+  // FileManager for file operations (SRP refactoring)
+  std::unique_ptr<ros2_kitti_publishers::FileManager> file_manager_;
 
   rclcpp::TimerBase::SharedPtr timer_;
 
