@@ -16,12 +16,12 @@ It was written for only learning purposes, not as a library logic.
 
 ## **Requirements**
 
-- Ubuntu 22.04+ (tested on Ubuntu 24.04)
-- ROS2 Jazzy Jalisco
-- pcl (Point Cloud Library)
-- OpenCV 4.x
-- Rviz2
-- rqt (optional)
+- **Ubuntu**: 24.04 (tested)
+- **ROS2**: Jazzy Jalisco
+- **PCL** (Point Cloud Library): 1.14.0 (tested)
+- **OpenCV**: 4.6.0 (tested)
+- **Rviz2**: Included with ROS2 Jazzy
+- **rqt**: Optional, included with ROS2 Jazzy
 
 ---
 ## __Setup__
